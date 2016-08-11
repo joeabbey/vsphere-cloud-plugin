@@ -17,7 +17,8 @@ node ("maven") {
   stage 'Results'
 
   /* Archive the test results */
-  step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+//  step([$class: 'JUnitResultArchiver', testResults: '**/target/surefire-reports/TEST-*.xml'])
+
 
   /* Archive the build artifacts */
   step([$class: 'ArtifactArchiver', artifacts: 'target/*.hpi,target/*.jpi'])

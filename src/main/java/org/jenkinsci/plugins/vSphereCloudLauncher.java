@@ -3,14 +3,16 @@
  * and open the template in the editor.
  */
 package org.jenkinsci.plugins;
- 
+
 import hudson.Util;
 import hudson.model.TaskListener;
 import hudson.model.Descriptor;
 import hudson.slaves.ComputerLauncher;
+import hudson.slaves.DelegatingComputerLauncher;
 import hudson.slaves.SlaveComputer;
 
 import java.io.IOException;
+import java.io.ObjectStreamException;
 import java.util.Calendar;
 
 import org.jenkinsci.plugins.vsphere.tools.VSphere;
@@ -28,9 +30,10 @@ import org.jenkinsci.plugins.vsphere.tools.VSphereException;
  *
  * @author Admin
  */
-public class vSphereCloudLauncher extends ComputerLauncher {
+public class vSphereCloudLauncher extends DelegatingComputerLauncher {
 
-    private final ComputerLauncher delegate;
+    @Deprecated
+    private transient ComputerLauncher delegate;
     private final Boolean overrideLaunchSupported;
     private final String vsDescription;
     private final String vmName;
@@ -39,7 +42,7 @@ public class vSphereCloudLauncher extends ComputerLauncher {
     private final int launchDelay;
     private final MACHINE_ACTION idleAction;
     private final int LimitedTestRunCount;
-    
+
     public enum MACHINE_ACTION {
         SHUTDOWN,
         REVERT,
@@ -51,13 +54,12 @@ public class vSphereCloudLauncher extends ComputerLauncher {
     }
 
     @DataBoundConstructor
-    public vSphereCloudLauncher(ComputerLauncher delegate,
+    public vSphereCloudLauncher(ComputerLauncher launcher,
             String vsDescription, String vmName,
             Boolean overrideLaunchSupported, Boolean waitForVMTools,
             String snapName, String launchDelay, String idleOption,
             String LimitedTestRunCount) {
-        super();
-        this.delegate = delegate;
+        super(launcher);
         this.overrideLaunchSupported = overrideLaunchSupported;
         this.vsDescription = vsDescription;
         this.vmName = vmName;
@@ -81,7 +83,34 @@ public class vSphereCloudLauncher extends ComputerLauncher {
         }
         this.LimitedTestRunCount = Util.tryParseNumber(LimitedTestRunCount, 0).intValue();
     }
-    
+
+    private vSphereCloudLauncher(ComputerLauncher launcher, Boolean overrideLaunchSupported, String vsDescription,
+                                String vmName, Boolean waitForVMTools, String snapName, int launchDelay,
+                                MACHINE_ACTION idleAction, int limitedTestRunCount) {
+        super(launcher);
+        this.overrideLaunchSupported = overrideLaunchSupported;
+        this.vsDescription = vsDescription;
+        this.vmName = vmName;
+        this.waitForVMTools = waitForVMTools;
+        this.snapName = snapName;
+        this.launchDelay = launchDelay;
+        this.idleAction = idleAction;
+        LimitedTestRunCount = limitedTestRunCount;
+    }
+
+    /**
+     * Migrates instances from the old parent class to the new parent class.
+     * @return the deserialized instance.
+     * @throws ObjectStreamException if something went wrong.
+     */
+    private Object readResolve() throws ObjectStreamException {
+        if (delegate != null) {
+            return new vSphereCloudLauncher(delegate, overrideLaunchSupported, vsDescription, vmName, waitForVMTools,
+                    snapName, launchDelay, idleAction, LimitedTestRunCount);
+        }
+        return this;
+    }
+
     public vSphereCloud findOurVsInstance() throws RuntimeException {
         if (vsDescription != null && vmName != null) {
             for (vSphereCloud cloud : vSphereCloud.findAllVsphereClouds()) {
@@ -110,7 +139,7 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                 }
 
                 // Slaves that take a while to start up make get multiple launch
-                // requests from Jenkins.  
+                // requests from Jenkins.
                 if (vsSlave.slaveIsStarting == Boolean.TRUE) {
                     vSphereCloud.Log(slaveComputer, taskListener, "Ignoring additional attempt to start the slave; it's already being started");
                     return;
@@ -144,14 +173,14 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                     v = vsC.vSphereInstance();
                     VirtualMachine vm = v.getVmByName(vmName);
                     if (vm == null) {
-                        throw new IOException("Virtual Machine could not be found");
+                        throw new IOException("Virtual Machine '" + vmName + "' could not be found");
                     }
 
                     // Revert to a snapshot - always - if one is specified.
                     if (!snapName.isEmpty()) {
                         VirtualMachineSnapshot snap = v.getSnapshotInTree(vm, snapName);
                         if (snap == null) {
-                            throw new IOException("Virtual Machine snapshot cannot be found");
+                            throw new IOException("Virtual Machine '" + vmName + "' snapshot '" + snapName + "' cannot be found");
                         }
 
                         vSphereCloud.Log(slaveComputer, taskListener, "Reverting to snapshot:" + snapName);
@@ -193,14 +222,22 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                     /* At this point we have told vSphere to get the VM going.
                      * Now we wait our launch delay amount before trying to connect.
                      */
-                    if (delegate.isLaunchSupported()) {
-                        // Delegate is going to do launch.
-                        Thread.sleep(launchDelay * 1000);
-                        delegate.launch(slaveComputer, taskListener);
+                    if (launcher.isLaunchSupported()) {
+                        if (launchDelay > 0) {
+                            vSphereCloud.Log(slaveComputer, taskListener, "Waiting for " + launchDelay
+                                    + " seconds before asking " + launcher + " to launch slave.");
+                            // Delegate is going to do launch.
+                            Thread.sleep(launchDelay * 1000);
+                        }
+                        vSphereCloud.Log(slaveComputer, taskListener, "Asking " + launcher.getClass().getSimpleName() + " to launch slave.");
+                        super.launch(slaveComputer, taskListener);
                     } else {
+                        vSphereCloud.Log(slaveComputer, taskListener, "Waiting for up to " + launchDelay
+                                + " seconds for slave to come online.");
                         for (int i = 0; i <= launchDelay; i++) {
                             Thread.sleep(1000);
                             if (slaveComputer.isOnline()) {
+                                vSphereCloud.Log(slaveComputer, taskListener, "Slave has come online.");
                                 break;
                             }
                         }
@@ -209,9 +246,9 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                             throw new IOException("Slave did not come online in allowed time");
                         }
                     }
+                    vSphereCloud.Log(slaveComputer, taskListener, "Slave online");
                 } catch (final Exception e) {
-                    vSphereCloud.Log(slaveComputer, taskListener, "EXCEPTION while starting VM");
-                    vSphereCloud.Log(slaveComputer, taskListener, e.getMessage());
+                    vSphereCloud.Log(slaveComputer, taskListener, e, "EXCEPTION while starting VM");
                     vsC.markVMOffline(slaveComputer.getDisplayName(), vmName);
                     throw new RuntimeException(e);
                 } finally {
@@ -220,6 +257,8 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                     if (v != null)
                         v.disconnect();
                 }
+            } catch (final RuntimeException e) {
+                throw e;
             } catch (final Exception e) {
                 throw new RuntimeException(e);
             }
@@ -229,7 +268,7 @@ public class vSphereCloudLauncher extends ComputerLauncher {
     @Override
     public synchronized void afterDisconnect(SlaveComputer slaveComputer, TaskListener taskListener) {
         final vSphereCloudSlave vsSlave = (vSphereCloudSlave) slaveComputer.getNode();
-        
+
         if(vsSlave == null) {
             vSphereCloud.Log(slaveComputer, taskListener, "Slave is null.");
             return;
@@ -248,12 +287,12 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                 return;
             }
         }
-        
+
         vsSlave.slaveIsDisconnecting = Boolean.TRUE;
         VSphere v = null;
         try {
             vSphereCloud.Log(slaveComputer, taskListener, "Running disconnect procedure...");
-            delegate.afterDisconnect(slaveComputer, taskListener);
+            super.afterDisconnect(slaveComputer, taskListener);
             vSphereCloud.Log(slaveComputer, taskListener, "Shutting down Virtual Machine...");
             MACHINE_ACTION localIdle = idleAction;
             if (localIdle == null) {
@@ -280,6 +319,8 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                         case RESET:
                             resetVM(vm, slaveComputer, taskListener);
                             break;
+                        case NOTHING:
+                            break;
                     }
                     if (localIdle == MACHINE_ACTION.REVERT) {
                         revertVM(vm, vsC, slaveComputer, taskListener);
@@ -299,12 +340,11 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                         // VM is already powered down.
                 }
             }
-            if (v != null)
+            if (v != null) {
                 v.disconnect();
+            }
         } catch (Throwable t) {
-            vSphereCloud.Log(slaveComputer, taskListener, "Got an exception");
-            vSphereCloud.Log(slaveComputer, taskListener, t.toString());
-            vSphereCloud.Log(slaveComputer, taskListener, "Printed exception");
+            vSphereCloud.Log(slaveComputer, taskListener, t, "Got an exception");
             taskListener.fatalError(t.getMessage(), t);
         } finally {
             vsSlave.slaveIsDisconnecting = Boolean.FALSE;
@@ -312,8 +352,12 @@ public class vSphereCloudLauncher extends ComputerLauncher {
         }
     }
 
+    /**
+     * @deprecated use {@link #getLauncher()}
+     */
+    @Deprecated
     public ComputerLauncher getDelegate() {
-        return delegate;
+        return launcher;
     }
 
     public String getVmName() {
@@ -339,19 +383,14 @@ public class vSphereCloudLauncher extends ComputerLauncher {
     public Integer getLimitedTestRunCount() {
         return LimitedTestRunCount;
     }
-        
+
     @Override
     public boolean isLaunchSupported() {
         if (this.overrideLaunchSupported == null) {
-            return delegate.isLaunchSupported();
+            return launcher.isLaunchSupported();
         } else {
             return overrideLaunchSupported;
         }
-    }
-
-    @Override
-    public void beforeDisconnect(SlaveComputer slaveComputer, TaskListener taskListener) {
-        delegate.beforeDisconnect(slaveComputer, taskListener); //this call does nothing.
     }
 
     @Override
@@ -389,10 +428,8 @@ public class vSphereCloudLauncher extends ComputerLauncher {
                     Thread.sleep(5000);
                 }
             } catch (Throwable t) {
-                vSphereCloud.Log(slaveComputer, taskListener,
+                vSphereCloud.Log(slaveComputer, taskListener, t,
                         "Got an exception while attempting a graceful shutdown");
-                vSphereCloud.Log(slaveComputer, taskListener, t.toString());
-                vSphereCloud.Log(slaveComputer, taskListener, "Printed exception");
                 vSphereCloud.Log(slaveComputer, taskListener, "Will now attempt a hard power down");
             }
         }
@@ -442,7 +479,7 @@ public class vSphereCloudLauncher extends ComputerLauncher {
         vSphereCloud.Log(slaveComputer, taskListener, "Suspending the VM");
         Task task = vm.suspendVM_Task();
         if (!task.waitForTask().equals(Task.SUCCESS)) {
-            vSphereCloud.Log(slaveComputer, taskListener, "Unable to susped the VM");
+            vSphereCloud.Log(slaveComputer, taskListener, "Unable to suspend the VM");
         }
     }
 }
